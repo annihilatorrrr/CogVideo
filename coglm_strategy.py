@@ -56,8 +56,8 @@ class CoglmStrategy:
             end_tokens = []
         self.end_tokens = end_tokens
         self._is_done = False
-        self.outlier_count_down = torch.zeros(16) 
-        self.vis_list = [[]for i in range(16)]
+        self.outlier_count_down = torch.zeros(16)
+        self.vis_list = [[] for _ in range(16)]
         self.cluster_labels = torch.tensor(np.load('cluster_label2.npy'), device='cuda', dtype=torch.long)
         self.start_pos = -1
         self.white_cluster = []

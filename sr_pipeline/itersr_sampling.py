@@ -120,7 +120,7 @@ def filling_sequence_itersr(
     '''
     assert hasattr(model, 'layout')
     layout = model.layout
-    
+
     device = seq0.device
     # concat and pad sequences
     batch_size = seq0.shape[0]
@@ -146,23 +146,23 @@ def filling_sequence_itersr(
     log_attention_weights = log_attention_weights.unsqueeze(0)
 
     # prepare for interation
-    unfixed = (tokens == tokenizer['<start_of_image>']) 
+    unfixed = (tokens == tokenizer['<start_of_image>'])
     ll, rr = block_hw
     edge_len = int(math.sqrt(layout[-1] - layout[-2]) + 1e-4)
     num_steps = 1
     # interative refining
-    
+
     # unfixed[..., -(layout[-1] - layout[-2]):].view(
     #     batch_size, edge_len//ll, ll, edge_len//rr, rr)[:, :, :, :, -1] = False
-    
-    
+
+
     ret = []
     # ret.append(tokens[:, layout[-2]:-1].clone())
-    for step_cnt in range(1, num_steps+1):
+    for _ in range(1, num_steps+1):
         logits, *_dump = model(tokens, position_ids, attention_mask, log_attention_weights=log_attention_weights)
         real_temp = 1.
         new_tokens = strategy.forward(logits, tokens, real_temp)
         tokens[unfixed] = new_tokens[unfixed]
-                
+
         ret.append(tokens[:, layout[-2]:].clone())
     return torch.cat(ret, dim=0)

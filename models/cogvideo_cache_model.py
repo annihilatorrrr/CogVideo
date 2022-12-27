@@ -48,8 +48,11 @@ def window_partition(x, window_size):
     """
     B, framenum, H, W, C = x.shape
     x = x.view(B, framenum, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 2, 4, 1, 3, 5, 6).contiguous().view(-1, framenum, window_size, window_size, C)
-    return windows
+    return (
+        x.permute(0, 2, 4, 1, 3, 5, 6)
+        .contiguous()
+        .view(-1, framenum, window_size, window_size, C)
+    )
 
 def window_reverse(windows, window_size, H, W):
     """
@@ -82,21 +85,31 @@ class WindowAttentionMixin(BaseMixin):
         super(WindowAttentionMixin, self).__init__()
         self.num_layers = num_layers # replace attention in the LAST n layers
         self.query_key_value = torch.nn.ModuleList(
-            [ColumnParallelLinear(hidden_size, 3*hidden_size,stride=3,
-                gather_output=False,init_method=init_method)
-                for layer_id in range(num_layers)
-            ])
+            [
+                ColumnParallelLinear(
+                    hidden_size,
+                    3 * hidden_size,
+                    stride=3,
+                    gather_output=False,
+                    init_method=init_method,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.dense = torch.nn.ModuleList(
-            [RowParallelLinear(
-                hidden_size,
-                hidden_size,
-                input_is_parallel=True,
-                init_method=output_layer_init_method,
-                bias=True,
-                module=self,
-                name="dense")
-                for layer_id in range(num_layers)
-            ])
+            [
+                RowParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    input_is_parallel=True,
+                    init_method=output_layer_init_method,
+                    bias=True,
+                    module=self,
+                    name="dense",
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         self.n_head = n_head
         self.window_size = window_size
@@ -107,7 +120,7 @@ class WindowAttentionMixin(BaseMixin):
         assert 0 < shift_size < window_size
         nW = (self.frame_resolution // self.window_size) ** 2
         ws_squre = self.window_size * self.window_size
-        
+
         # odd non-shift, even shift
         img_mask = torch.zeros((1, 1, frame_resolution, frame_resolution, 1))
         h_slices = (slice(0, -shift_size),
@@ -122,10 +135,12 @@ class WindowAttentionMixin(BaseMixin):
         mask_windows = window_partition(img_mask, self.window_size)  # nW, 1, window_size, window_size, 1
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         sub_attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2) #[nW, self.window_size * self.window_size, self.window_size * self.window_size]
-        sub_attn_mask = sub_attn_mask.masked_fill(sub_attn_mask != 0, float(0.0)).masked_fill(sub_attn_mask == 0, float(1.00))
+        sub_attn_mask = sub_attn_mask.masked_fill(
+            sub_attn_mask != 0, 0.0
+        ).masked_fill(sub_attn_mask == 0, 1.0)
         attn_mask = sub_attn_mask.repeat(1, frame_num, frame_num)
         attn_mask = attn_mask.tril()
-        
+
         causal_mask = torch.ones(ws_squre*frame_num, ws_squre*frame_num)
         causal_mask = causal_mask.tril()
 
@@ -133,7 +148,7 @@ class WindowAttentionMixin(BaseMixin):
         self.attn_mask = attn_mask
         self.causal_mask = causal_mask
         self.mask_initialized = False
-        
+
         self.attn_distribution = torch.nn.ParameterList([
             torch.nn.Parameter(torch.zeros(hidden_size))
             for _ in range(num_layers)
@@ -236,7 +251,7 @@ class WindowAttentionMixin(BaseMixin):
         # memkv [batchsize, pos, hidden_size*2] (include frames only)
         # if memkv_text is not None: will attend to text
         # pos: token's pos
-        b0, sin, h0 = frame_hidden_state.shape 
+        b0, sin, h0 = frame_hidden_state.shape
         h = h0 // self.n_head
         assert sin == 1
         this_qkv = self.query_key_value[layer_id](frame_hidden_state)
@@ -244,11 +259,11 @@ class WindowAttentionMixin(BaseMixin):
         s1 = memkv.shape[1] if memkv is not None else 0
         frame_len = self.frame_resolution * self.frame_resolution
         frame_num_before = s1 // frame_len
-        
-        
+
+
         if memkv is not None:
             pos_inframe = pos - frame_num_before * frame_len
-            
+
             xpos = pos_inframe // self.frame_resolution # pos = xpos*self.frame_resolution + ypos
             ypos = pos_inframe % self.frame_resolution
             # [start, end)
@@ -263,19 +278,27 @@ class WindowAttentionMixin(BaseMixin):
                 xstart = (xpos // self.window_size) * self.window_size
                 ystart = (ypos // self.window_size) * self.window_size
                 xend, yend = xstart + self.window_size, ystart+self.window_size
-            
-            # select index 
-            selected_index = list()
+
+            # select index
+            selected_index = []
             if frame_num_before > 0:
                 # frames before
                 frame_attended_start = max(0, frame_num_before-self.time_dim_attend_length+1) if self.time_dim_attend_length > 0 else 0
                 for x in range(xstart, xend):
-                    for y in range(ystart, yend):
-                        selected_index.append(x*self.frame_resolution+y+frame_len*frame_attended_start)
+                    selected_index.extend(
+                        x * self.frame_resolution
+                        + y
+                        + frame_len * frame_attended_start
+                        for y in range(ystart, yend)
+                    )
                 cnt_per_frame = len(selected_index)
-                for _ in range((frame_num_before-frame_attended_start-1)*cnt_per_frame):
-                    selected_index.append(selected_index[-cnt_per_frame]+frame_len)
-                    
+                selected_index.extend(
+                    selected_index[-cnt_per_frame] + frame_len
+                    for _ in range(
+                        (frame_num_before - frame_attended_start - 1)
+                        * cnt_per_frame
+                    )
+                )
             # the last frame
             for x in range(xstart, xend):
                 for y in range(ystart, yend):
@@ -299,7 +322,7 @@ class WindowAttentionMixin(BaseMixin):
         else: 
             used_k = thisk
             used_v = thisv
-            
+
             if memkv_text is not None:
                 used_k = torch.cat((memkv_text[..., :h0].expand(thisk.shape[0], -1, -1), used_k), dim=-2)
                 used_v = torch.cat((memkv_text[..., h0:].expand(thisv.shape[0], -1, -1), used_v), dim=-2)
@@ -308,7 +331,7 @@ class WindowAttentionMixin(BaseMixin):
             else:
                 used_k = used_k.reshape(b0, 1, self.n_head, h).permute(0, 2, 1, 3)
                 used_v = used_v.reshape(b0, 1, self.n_head, h).permute(0, 2, 1, 3)
-        
+
         thisq = thisq.reshape(b0, 1, self.n_head, h).permute(0, 2, 1, 3) # [b0, n_head, 1, h]
         attn = torch.matmul(thisq / math.sqrt(h), used_k.transpose(-1, -2))
         if memkv_text is not None:
@@ -331,26 +354,36 @@ class FullAttentionMixin(BaseMixin):
         super(FullAttentionMixin, self).__init__()
         self.num_layers = num_layers # replace attention in the LAST n layers
         self.query_key_value = torch.nn.ModuleList(
-            [ColumnParallelLinear(hidden_size, 3*hidden_size,stride=3,
-                gather_output=False,init_method=init_method)
-                for layer_id in range(num_layers)
-            ])
+            [
+                ColumnParallelLinear(
+                    hidden_size,
+                    3 * hidden_size,
+                    stride=3,
+                    gather_output=False,
+                    init_method=init_method,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.dense = torch.nn.ModuleList(
-            [RowParallelLinear(
-                hidden_size,
-                hidden_size,
-                input_is_parallel=True,
-                init_method=output_layer_init_method,
-                bias=True,
-                module=self,
-                name="dense")
-                for layer_id in range(num_layers)
-            ])
+            [
+                RowParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    input_is_parallel=True,
+                    init_method=output_layer_init_method,
+                    bias=True,
+                    module=self,
+                    name="dense",
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         self.n_head = n_head
         self.frame_resolution = frame_resolution
         self.frame_len = frame_resolution * frame_resolution
-        
+
         self.attn_distribution = torch.nn.ParameterList([
             torch.nn.Parameter(torch.zeros(hidden_size))
             for _ in range(num_layers)
@@ -511,15 +544,19 @@ def attention_localframe_and_text_AR(q0, k0, v0, n_head, text_len, frame_len, fr
     q0 = q0.reshape(b, 1, n_head, h).permute(0, 2, 1, 3)
     v0 = v0.reshape(b, s0, n_head, h).permute(0, 2, 1, 3)
     k0T = k0.reshape(b, s0, n_head, h).permute(0, 2, 3, 1)
-    
+
     if limited_spatial_channel_mem:
         assert frame_num_before == 0
         assert stage == 1 # not implemented for stage-2 yet
         score = torch.matmul(q0 / math.sqrt(q0.shape[-1]), k0T)
         score[..., :text_len] += log_text_attention_weights
         attention_probs_frame = F.softmax(score, dim=-1)
-        context_frame = torch.matmul(attention_probs_frame, v0).transpose(1, 2).reshape(b, 1, h0)
-        
+        return (
+            torch.matmul(attention_probs_frame, v0)
+            .transpose(1, 2)
+            .reshape(b, 1, h0)
+        )
+
     else:
         score_token2text = torch.matmul(q0 / math.sqrt(q0.shape[-1]), k0T[..., :text_len])
         score_token2text += log_text_attention_weights
@@ -527,13 +564,15 @@ def attention_localframe_and_text_AR(q0, k0, v0, n_head, text_len, frame_len, fr
         score_frame_all = torch.cat((score_token2text, 
                                     score_frame_local0), dim=-1)
         attention_probs_frame = F.softmax(score_frame_all, dim=-1)
-        
+
         context_token2text = torch.matmul(attention_probs_frame[..., :text_len], v0[..., :text_len, :]) # [b, n_head, s1, h]
         context_frame_local0 = torch.matmul(attention_probs_frame[..., text_len:], \
             v0[:, :, text_len+frame_num_before*frame_len:, :])
-        context_frame = (context_token2text + context_frame_local0).transpose(1, 2).reshape(b, 1, h0)
-    
-    return context_frame
+        return (
+            (context_token2text + context_frame_local0)
+            .transpose(1, 2)
+            .reshape(b, 1, h0)
+        )
 
     
 class CogVideoCacheModel(BaseModel):
@@ -604,11 +643,10 @@ class CogVideoCacheModel(BaseModel):
                     ),
                     dim=-2
                 )
+        elif position_ids[0, 0] >= (512+400):
+            position_embeddings = self.get_mixin('extra_position_embedding').position_embeddings(position_ids-(512+400))
         else:
-            if position_ids[0, 0] >= (512+400):
-                position_embeddings = self.get_mixin('extra_position_embedding').position_embeddings(position_ids-(512+400))
-            else:
-                position_embeddings = self.transformer.position_embeddings(position_ids)
+            position_embeddings = self.transformer.position_embeddings(position_ids)
         return position_embeddings
         
     def attention_forward(self, hidden_states, mask, layer_id, mems=None, log_text_attention_weights=0, text_len=0, frame_len=0, counter=0, enforce_no_swin=False, limited_spatial_channel_mem=False, **kw_args):

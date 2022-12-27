@@ -50,17 +50,28 @@ class AttentionMixin(BaseMixin):
         super(AttentionMixin, self).__init__()
         self.num_layers = num_layers  # replace attention in the LAST n layers
         self.query_key_value = torch.nn.ModuleList(
-            [ColumnParallelLinear(hidden_size, 3 * hidden_size, stride=3,
-                                  gather_output=False, init_method=init_method)
-             for layer_id in range(num_layers)
-             ])
+            [
+                ColumnParallelLinear(
+                    hidden_size,
+                    3 * hidden_size,
+                    stride=3,
+                    gather_output=False,
+                    init_method=init_method,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.dense = torch.nn.ModuleList(
-            [RowParallelLinear(hidden_size,
-                               hidden_size,
-                               input_is_parallel=True,
-                               init_method=output_layer_init_method)
-             for layer_id in range(num_layers)
-             ])
+            [
+                RowParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    input_is_parallel=True,
+                    init_method=output_layer_init_method,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
     def reinit(self, parent_model=None):
         start_layer = len(self.transformer.layers) - self.num_layers
@@ -106,7 +117,7 @@ class DsrModel(BaseModel):
                         layer_id=None, log_attention_weights=None, **kw_args):
         attn_module = self.transformer.layers[layer_id].attention
         # attention_plus on all layers
-        query_key_value_plus = self.get_mixin('attention_plus').query_key_value[layer_id] 
+        query_key_value_plus = self.get_mixin('attention_plus').query_key_value[layer_id]
         dense_plus = self.get_mixin('attention_plus').dense[layer_id]
         # split two parts
         hidden_states_plus = hidden_states[:, self.layout[1]:]
@@ -117,28 +128,30 @@ class DsrModel(BaseModel):
         # cuda2d model qkv
         mixed_raw_layer = query_key_value_plus(hidden_states_plus)
         q1, k1, v1 = split_tensor_along_last_dim(mixed_raw_layer, 3)
-        
+
         dropout_fn = attn_module.attention_dropout if self.training else None
 
         # cuda2d attention
         context_layer0, context_layer1 = sparse_attention_2d_light(
-                q0, k0, v0,
-                q1, k1, v1,
-                mask,
-                n_head=attn_module.num_attention_heads_per_partition,
-                text_len=self.layout[0],
-                kernel_size=self.kernel_size,
-                kernel_size2=self.kernel_size2,
-                attention_dropout=dropout_fn,
-                log_attention_weights=log_attention_weights,
-                add_scalar=(kw_args['add_scalar'] if 'add_scalar' in kw_args else 0)
-            )
+            q0,
+            k0,
+            v0,
+            q1,
+            k1,
+            v1,
+            mask,
+            n_head=attn_module.num_attention_heads_per_partition,
+            text_len=self.layout[0],
+            kernel_size=self.kernel_size,
+            kernel_size2=self.kernel_size2,
+            attention_dropout=dropout_fn,
+            log_attention_weights=log_attention_weights,
+            add_scalar=kw_args.get('add_scalar', 0),
+        )
 
         output_0 = attn_module.dense(context_layer0)
         output_1 = dense_plus(context_layer1)
-        output = torch.cat((output_0, output_1), dim=1)
-        
-        return output
+        return torch.cat((output_0, output_1), dim=1)
 
     def final_forward(self, logits, **kwargs):
         logits_parallel = logits

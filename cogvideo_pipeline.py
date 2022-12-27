@@ -126,8 +126,15 @@ def my_save_multiple_images(imgs, path, subdir, debug=True):
         for i in range(len(imgs)):
             save_image(imgs[i], os.path.join(single_frame_path, f'{str(i).rjust(4,"0")}.jpg'), normalize=True)
             os.chmod(os.path.join(single_frame_path,f'{str(i).rjust(4,"0")}.jpg'), stat.S_IRWXO+stat.S_IRWXG+stat.S_IRWXU)
-        save_image(torch.cat(imgs, dim=0), os.path.join(single_frame_path,f'frame_concat.jpg'), normalize=True)
-        os.chmod(os.path.join(single_frame_path,f'frame_concat.jpg'), stat.S_IRWXO+stat.S_IRWXG+stat.S_IRWXU)
+        save_image(
+            torch.cat(imgs, dim=0),
+            os.path.join(single_frame_path, 'frame_concat.jpg'),
+            normalize=True,
+        )
+        os.chmod(
+            os.path.join(single_frame_path, 'frame_concat.jpg'),
+            stat.S_IRWXO + stat.S_IRWXG + stat.S_IRWXU,
+        )
         
 def calc_next_tokens_frame_begin_id(text_len, frame_len, total_len):
     # The fisrt token's position id of the frame that the next token belongs to; 
@@ -170,24 +177,24 @@ def my_filling_sequence(
 
     # building the initial tokens, attention_mask, and position_ids
     actual_context_length = 0
-    
+
     while seq[-1][actual_context_length] >= 0: # the last seq has least given tokens
         actual_context_length += 1 # [0, context_length-1] are given
     assert actual_context_length > 0
     current_frame_num = (actual_context_length-text_len) // frame_len
     assert current_frame_num >= 0
     context_length = text_len + current_frame_num * frame_len
-    
+
     tokens, attention_mask, position_ids = get_masks_and_position_ids(seq, text_len, frame_len)
     tokens = tokens[..., :context_length]
     input_tokens = tokens.clone()
-    
+
     if guider_seq is not None:
         guider_index_delta = text_len - guider_text_len
         guider_tokens, guider_attention_mask, guider_position_ids = get_masks_and_position_ids(guider_seq, guider_text_len, frame_len)
         guider_tokens = guider_tokens[..., :context_length-guider_index_delta]
         guider_input_tokens = guider_tokens.clone()
-        
+
     for fid in range(current_frame_num):
         input_tokens[:, text_len+400*fid] = tokenizer['<start_of_image>']
         if guider_seq is not None:
@@ -203,14 +210,14 @@ def my_filling_sequence(
     mems_buffers = [torch.zeros(args.num_layers, batch_size, mem_len, args.hidden_size*2, dtype=next(model.parameters()).dtype)
                         for mem_len in mems_len]
 
-    
+
     if guider_seq is not None: 
         guider_attention_mask = guider_attention_mask.type_as(next(model.parameters())) # if fp16
         guider_mems_buffers = [torch.zeros(args.num_layers, batch_size, mem_len, args.hidden_size*2, dtype=next(model.parameters()).dtype)
                         for mem_len in mems_len]
         guider_mems_indexs = [0, 0]
         guider_mems = None
-    
+
     torch.cuda.empty_cache()
     # step-by-step generation
     while counter < len(seq[0]) - 1:
@@ -219,7 +226,7 @@ def my_filling_sequence(
         # token[:, index: counter+1] needs forwarding.
         if index == 0:
             group_size = 2 if (input_tokens.shape[0] == batch_size and not mode_stage1) else batch_size
-            
+
             logits_all = None
             for batch_idx in range(0, input_tokens.shape[0], group_size):
                 logits, *output_per_layers = model(
@@ -251,7 +258,7 @@ def my_filling_sequence(
 
             mems = [mems_buffers[id][:, :, :mems_indexs[id]] for id in range(2)]
             logits = logits_all
-            
+
             # Guider 
             if guider_seq is not None:
                 guider_logits_all = None
@@ -285,15 +292,8 @@ def my_filling_sequence(
                 guider_mems = [guider_mems_buffers[id][:, :, :guider_mems_indexs[id]] for id in range(2)]
                 guider_logits = guider_logits_all
         else:
-            if not mems_buffers_on_GPU:
-                if not mode_stage1:
-                    torch.cuda.empty_cache()
-                    for idx, mem in enumerate(mems):
-                        mems[idx] = mem.to(next(model.parameters()).device)
-                    if guider_seq is not None:
-                        for idx, mem in enumerate(guider_mems):
-                            guider_mems[idx] = mem.to(next(model.parameters()).device) 
-                else: 
+            if mode_stage1:
+                if not mems_buffers_on_GPU: 
                     torch.cuda.empty_cache()
                     for idx, mem_buffer in enumerate(mems_buffers):
                         mems_buffers[idx] = mem_buffer.to(next(model.parameters()).device)
@@ -303,7 +303,14 @@ def my_filling_sequence(
                             guider_mems_buffers[idx] = guider_mem_buffer.to(next(model.parameters()).device)
                         guider_mems = [guider_mems_buffers[id][:, :, :guider_mems_indexs[id]] for id in range(2)]
                     mems_buffers_on_GPU = True
-                    
+
+            elif not mems_buffers_on_GPU:
+                torch.cuda.empty_cache()
+                for idx, mem in enumerate(mems):
+                    mems[idx] = mem.to(next(model.parameters()).device)
+                if guider_seq is not None:
+                    for idx, mem in enumerate(guider_mems):
+                        guider_mems[idx] = mem.to(next(model.parameters()).device)
             logits, *output_per_layers = model(
                 input_tokens[:, index:],
                 position_ids[..., index: counter+1],
@@ -318,7 +325,7 @@ def my_filling_sequence(
                 **kw_args
             )
             mem_kv0, mem_kv1 = [o['mem_kv'][0] for o in output_per_layers], [o['mem_kv'][1] for o in output_per_layers]
-            
+
             if guider_seq is not None:
                 guider_logits, *guider_output_per_layers = model(
                     guider_input_tokens[:, max(index-guider_index_delta, 0):],
@@ -334,7 +341,7 @@ def my_filling_sequence(
                     **kw_args
                 )
                 guider_mem_kv0, guider_mem_kv1 = [o['mem_kv'][0] for o in guider_output_per_layers], [o['mem_kv'][1] for o in guider_output_per_layers]
-            
+
             if not mems_buffers_on_GPU:
                 torch.cuda.empty_cache()
                 for idx, mem_buffer in enumerate(mems_buffers):
@@ -344,12 +351,12 @@ def my_filling_sequence(
                         guider_mems_buffers[idx] = guider_mem_buffer.to(next(model.parameters()).device)
                 mems_buffers_on_GPU = True
 
-            mems, mems_indexs = my_update_mems([mem_kv0, mem_kv1], mems_buffers, mems_indexs, limited_spatial_channel_mem, text_len, frame_len) 
+            mems, mems_indexs = my_update_mems([mem_kv0, mem_kv1], mems_buffers, mems_indexs, limited_spatial_channel_mem, text_len, frame_len)
             if guider_seq is not None: 
                 guider_mems, guider_mems_indexs = my_update_mems([guider_mem_kv0, guider_mem_kv1], guider_mems_buffers, guider_mems_indexs, limited_spatial_channel_mem, guider_text_len, frame_len)
 
-       
-        counter += 1 
+
+        counter += 1
         index = counter        
 
         logits = logits[:, -1].expand(batch_size, -1) # [batch size, vocab size]
@@ -357,7 +364,7 @@ def my_filling_sequence(
         if guider_seq is not None:
             guider_logits = guider_logits[:, -1].expand(batch_size, -1)
             guider_tokens = guider_tokens.expand(batch_size, -1)
-        
+
         if seq[-1][counter].item() < 0:
             # sampling
             guided_logits = guider_logits+(logits-guider_logits)*guidance_alpha if guider_seq is not None else logits
@@ -367,21 +374,21 @@ def my_filling_sequence(
                 tokens, mems = strategy2.forward(guided_logits, tokens, mems)
             if guider_seq is not None:
                 guider_tokens = torch.cat((guider_tokens, tokens[:, -1:]), dim=1)
-                
+
             if seq[0][counter].item() >= 0:
                 for si in range(seq.shape[0]):
                     if seq[si][counter].item() >= 0:
                         tokens[si, -1] = seq[si, counter]
                         if guider_seq is not None:
                             guider_tokens[si, -1] = guider_seq[si, counter-guider_index_delta]
-                    
+
         else:
             tokens = torch.cat((tokens, seq[:, counter:counter+1].clone().expand(tokens.shape[0], 1).to(device=tokens.device, dtype=tokens.dtype)), dim=1)
             if guider_seq is not None: 
                 guider_tokens = torch.cat((guider_tokens, 
                                            guider_seq[:, counter-guider_index_delta:counter+1-guider_index_delta]
                                            .clone().expand(guider_tokens.shape[0], 1).to(device=guider_tokens.device, dtype=guider_tokens.dtype)), dim=1)
-        
+
         input_tokens = tokens.clone()
         if guider_seq is not None:
             guider_input_tokens = guider_tokens.clone()
@@ -392,7 +399,7 @@ def my_filling_sequence(
                 if guider_seq is not None:
                     guider_input_tokens[:, boi_idx-guider_index_delta] = tokenizer['<start_of_image>']
                 boi_idx += 400
-        
+
         if strategy.is_done:
             break
     return strategy.finalize(tokens, mems)

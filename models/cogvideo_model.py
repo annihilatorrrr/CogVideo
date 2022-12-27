@@ -44,8 +44,11 @@ def window_partition(x, window_size):
     """
     B, framenum, H, W, C = x.shape
     x = x.view(B, framenum, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 2, 4, 1, 3, 5, 6).contiguous().view(-1, framenum, window_size, window_size, C)
-    return windows
+    return (
+        x.permute(0, 2, 4, 1, 3, 5, 6)
+        .contiguous()
+        .view(-1, framenum, window_size, window_size, C)
+    )
 
 def window_reverse(windows, window_size, H, W):
     """
@@ -77,22 +80,31 @@ class WindowAttentionMixin(BaseMixin):
         super(WindowAttentionMixin, self).__init__()
         self.num_layers = num_layers # replace attention in the LAST n layers
         self.query_key_value = torch.nn.ModuleList(
-            [ColumnParallelLinear(hidden_size, 3*hidden_size,stride=3,
-                gather_output=False,init_method=init_method)
-                for layer_id in range(num_layers)
-            ])
+            [
+                ColumnParallelLinear(
+                    hidden_size,
+                    3 * hidden_size,
+                    stride=3,
+                    gather_output=False,
+                    init_method=init_method,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.dense = torch.nn.ModuleList(
-            [RowParallelLinear(
-                hidden_size,
-                hidden_size,
-                input_is_parallel=True,
-                init_method=output_layer_init_method,
-                bias=True,
-                module=self,
-                name="dense",
-                ) 
-                for layer_id in range(num_layers)
-            ])
+            [
+                RowParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    input_is_parallel=True,
+                    init_method=output_layer_init_method,
+                    bias=True,
+                    module=self,
+                    name="dense",
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         self.n_head = n_head
         self.window_size = window_size
@@ -102,7 +114,7 @@ class WindowAttentionMixin(BaseMixin):
         assert 0 < shift_size < window_size
         nW = (self.frame_resolution // self.window_size) ** 2
         ws_squre = self.window_size * self.window_size
-        
+
         # odd non-shift, even shift
         img_mask = torch.zeros((1, 1, frame_resolution, frame_resolution, 1))
         h_slices = (slice(0, -shift_size),
@@ -117,12 +129,14 @@ class WindowAttentionMixin(BaseMixin):
         mask_windows = window_partition(img_mask, self.window_size)  # nW, 1, window_size, window_size, 1
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         sub_attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2) #[nW, self.window_size * self.window_size, self.window_size * self.window_size]
-        sub_attn_mask = sub_attn_mask.masked_fill(sub_attn_mask != 0, float(0.0)).masked_fill(sub_attn_mask == 0, float(1.00))
+        sub_attn_mask = sub_attn_mask.masked_fill(
+            sub_attn_mask != 0, 0.0
+        ).masked_fill(sub_attn_mask == 0, 1.0)
         attn_mask = sub_attn_mask.repeat(1, frame_num, frame_num)
-        
+
         self.attn_mask_sequential = attn_mask.clone().tril()
         self.causal_mask_sequential = torch.ones(1, ws_squre*frame_num, ws_squre*frame_num).tril()
-        
+
         self.causal_mask_interp = torch.ones(1, ws_squre*frame_num, ws_squre*frame_num)
         self.attn_mask_interp = attn_mask.clone()
 
@@ -144,12 +158,12 @@ class WindowAttentionMixin(BaseMixin):
         self.attn_mask_interp = self.attn_mask_interp[None, None, :, None]
         self.causal_mask_sequential = self.causal_mask_sequential[None, None, :, None]
         self.causal_mask_interp = self.causal_mask_interp[None, None, :, None]
-                
+
         self.shift_sizes = [0, shift_size]
         # self.register_buffer("attn_mask", attn_mask)
         # self.register_buffer("causal_mask", causal_mask)
         self.mask_initialized = False
-        
+
         self.attn_distribution = torch.nn.ParameterList([
             torch.nn.Parameter(torch.zeros(hidden_size))
             for _ in range(num_layers)
@@ -168,7 +182,7 @@ class WindowAttentionMixin(BaseMixin):
         # pb relax 
         swin_pb_relax = True
         alpha = 16
-        
+
         # frame_hidden_state [batchsize, frame_num*frame_size, n_head*hiddensize_perhead]
         if not self.mask_initialized:
             self.attn_mask_sequential = self.attn_mask_sequential.to(device=frame_hidden_state.device, dtype=frame_hidden_state.dtype)
@@ -176,7 +190,7 @@ class WindowAttentionMixin(BaseMixin):
             self.attn_mask_interp = self.attn_mask_interp.to(device=frame_hidden_state.device, dtype=frame_hidden_state.dtype)
             self.causal_mask_interp = self.causal_mask_interp.to(device=frame_hidden_state.device, dtype=frame_hidden_state.dtype)
             self.mask_initialized = True
-        b0, s1, h0 = frame_hidden_state.shape 
+        b0, s1, h0 = frame_hidden_state.shape
         h = h0 // self.n_head
         frame_len = self.frame_resolution * self.frame_resolution
         frame_num = s1 // frame_len
@@ -184,14 +198,14 @@ class WindowAttentionMixin(BaseMixin):
         wind_square = self.window_size * self.window_size
         nW = frame_len // wind_square
         bswin = b0 * nW
-        
+
         causal_mask = self.causal_mask_sequential if mode_sequential else self.causal_mask_interp
         attn_mask = self.attn_mask_sequential if mode_sequential else self.attn_mask_interp
         if text_hidden_state is not None:
             s0 = text_hidden_state.shape[1]
             qkv_text = self.query_key_value[layer_id](text_hidden_state).reshape(b0, s0, 3, self.n_head, h).permute(2, 0, 3, 1, 4) #[3, b0, n_head, s0, h]
             q_text, k_text, v_text = qkv_text[0], qkv_text[1], qkv_text[2]
-            
+
         # shift
         frame_hidden_state = frame_hidden_state.reshape(b0, frame_num, self.frame_resolution, self.frame_resolution, h0)
         if self.shift_sizes[layer_id%2] > 0:
@@ -199,9 +213,9 @@ class WindowAttentionMixin(BaseMixin):
         # window partition    
         frame_hidden_state = window_partition(frame_hidden_state, self.window_size).reshape(bswin, frame_num*wind_square, h0)
         qkv = self.query_key_value[layer_id](frame_hidden_state).reshape(bswin, frame_num*wind_square, 3, self.n_head, h)\
-                .permute(2, 0, 3, 1, 4) #[3, bswin, n_head, frame_num*wind_size*wind_size, h]
+                    .permute(2, 0, 3, 1, 4) #[3, bswin, n_head, frame_num*wind_size*wind_size, h]
         q, k, v = qkv[0], qkv[1], qkv[2]
-        
+
         # pb-relax
         if swin_pb_relax:
             attn = torch.matmul(q / (math.sqrt(h)*alpha), k.transpose(-1, -2))
@@ -211,16 +225,15 @@ class WindowAttentionMixin(BaseMixin):
         if self.shift_sizes[layer_id%2] > 0:
             # attn = attn.view(bswin // nW, nW, self.n_head, frame_num*wind_square, frame_num*wind_square) + self.attn_mask.unsqueeze(1).unsqueeze(0)
             attn = torch.mul(attn.view(bswin // nW, nW, self.n_head, frame_num*wind_square, frame_num*wind_square), attn_mask)\
-                 - 10000.0 * (1.0 - attn_mask)
-            attn = attn.view(bswin, self.n_head, frame_num*wind_square, frame_num*wind_square)
+                     - 10000.0 * (1.0 - attn_mask)
         else:
             attn = torch.mul(attn.view(bswin // nW, nW, self.n_head, frame_num*wind_square, frame_num*wind_square), causal_mask)\
-                 - 10000.0 * (1.0 - causal_mask)
-            attn = attn.view(bswin, self.n_head, frame_num*wind_square, frame_num*wind_square)
+                     - 10000.0 * (1.0 - causal_mask)
+        attn = attn.view(bswin, self.n_head, frame_num*wind_square, frame_num*wind_square)
         if swin_pb_relax:
             swin_pb_relax_const = torch.max(attn.reshape(bswin, self.n_head, -1), dim=-1, keepdim=True)[0].detach().unsqueeze(-1)
             attn = (attn - swin_pb_relax_const)*alpha
-            
+
         if text_hidden_state is None:
             attn = F.softmax(attn, dim=-1)
             if attn_dropout is not None:
@@ -241,16 +254,16 @@ class WindowAttentionMixin(BaseMixin):
             attn_frame2text = attn_frame2text.reshape(bswin, self.n_head, frame_num*wind_square, s0)
             attn = torch.cat((attn, attn_frame2text), dim=-1)
             attn = F.softmax(attn, dim=-1)
-            
+
             if attn_dropout is not None:
                 with get_cuda_rng_tracker().fork():
                     attn = attn_dropout(attn)
-                    
+
             context_swin = (torch.matmul(attn[..., :-s0], v) + 
                             torch.matmul(attn[..., -s0:].reshape(b0, -1, self.n_head,frame_num*wind_square, s0), v_text.unsqueeze(1))\
-                                .reshape(bswin, self.n_head, frame_num*wind_square, h))\
-                .permute(0, 2, 1, 3).reshape(bswin, frame_num, self.window_size, self.window_size, h0)
-                
+                                    .reshape(bswin, self.n_head, frame_num*wind_square, h))\
+                    .permute(0, 2, 1, 3).reshape(bswin, frame_num, self.window_size, self.window_size, h0)
+
         context_swin = window_reverse(context_swin, self.window_size, self.frame_resolution, self.frame_resolution)
         # reverse cycle shift
         if self.shift_sizes[layer_id%2] > 0:
@@ -272,29 +285,39 @@ class FullAttentionMixin(BaseMixin):
         super(FullAttentionMixin, self).__init__()
         self.num_layers = num_layers # replace attention in the LAST n layers
         self.query_key_value = torch.nn.ModuleList(
-            [ColumnParallelLinear(hidden_size, 3*hidden_size,stride=3,
-                gather_output=False,init_method=init_method) 
-                for layer_id in range(num_layers)
-            ])
+            [
+                ColumnParallelLinear(
+                    hidden_size,
+                    3 * hidden_size,
+                    stride=3,
+                    gather_output=False,
+                    init_method=init_method,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         self.dense = torch.nn.ModuleList(
-            [RowParallelLinear(
-                hidden_size,
-                hidden_size,
-                input_is_parallel=True,
-                init_method=output_layer_init_method,
-                bias=True,
-                module=self,
-                name="dense",)
-                for layer_id in range(num_layers)
-            ])
+            [
+                RowParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    input_is_parallel=True,
+                    init_method=output_layer_init_method,
+                    bias=True,
+                    module=self,
+                    name="dense",
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         self.n_head = n_head
         self.frame_resolution = frame_resolution
         self.frame_len = frame_resolution * frame_resolution
         self.causal_mask = torch.ones(1, 1, self.frame_len*frame_num, self.frame_len*frame_num).tril()
-        
+
         self.mask_initialized = False
-        
+
         self.attn_distribution = torch.nn.ParameterList([
             torch.nn.Parameter(torch.zeros(hidden_size))
             for _ in range(num_layers)
@@ -433,17 +456,17 @@ class CogVideoModel(BaseModel):
     def __init__(self, args, transformer=None, parallel_output=True):
         super().__init__(args, transformer=transformer, parallel_output=parallel_output)
         self.stage = args.cogvideo_stage # 1 or 2
-        self.mode_sequential = True if self.stage==1 else False
+        self.mode_sequential = self.stage == 1
         self.layout = args.layout # [64, 64+400, 64+5*400]
         self.n_head = args.num_attention_heads
         frame_resolution = int(math.sqrt(self.layout[1]-self.layout[0]))
         frame_num = (args.layout[2]-args.layout[0])//(args.layout[1]-args.layout[0])
         frame_len = self.layout[1]-self.layout[0]
-        
+
         self.add_mixin('extra_position_embedding', PositionEmbeddingMixin(
             args.additional_seqlen, args.hidden_size
         ))
-        
+
         if args.window_size == -1:
             # full attention
             assert self.stage == 1
@@ -503,11 +526,11 @@ class CogVideoModel(BaseModel):
             self.attention_mask_local_sequential = self.attention_mask_local_sequential.to(device=hidden_states.device, dtype=hidden_states.dtype)
             self.attention_mask_local_interp = self.attention_mask_local_interp.to(device=hidden_states.device, dtype=hidden_states.dtype)
             self.mask_initialized = True
-        
+
         attn_module = self.transformer.layers[layer_id].attention
         hidden_size = hidden_states.shape[-1]
         bs = hidden_states.shape[0]
-        
+
         # base model qkv
         mixed_raw_layer = attn_module.query_key_value(hidden_states)
         q0, k0, v0 = split_tensor_along_last_dim(mixed_raw_layer, 3)
@@ -531,13 +554,11 @@ class CogVideoModel(BaseModel):
             text_hidden_state=hidden_states[:, :self.layout[0]], 
             text_attn_mask=mask[..., 0, :],
             mode_sequential=self.mode_sequential)
-            
+
         attn_distrib = torch.sigmoid(self.get_mixin('attention_plus').attn_distribution[layer_id])
         attn_distrib = attn_distrib.unsqueeze(0).unsqueeze(0)
-        
+
         output_text = attn_module.dense(context_text)
         output_frame = torch.mul(attn_module.dense(context_frame_local_text), attn_distrib)\
-            +torch.mul(self.get_mixin('attention_plus').dense[layer_id](context_frame_swin), 1-attn_distrib)
-        output = torch.cat((output_text, output_frame), dim=-2)
-
-        return output
+                +torch.mul(self.get_mixin('attention_plus').dense[layer_id](context_frame_swin), 1-attn_distrib)
+        return torch.cat((output_text, output_frame), dim=-2)

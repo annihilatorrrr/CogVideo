@@ -115,27 +115,25 @@ def filling_sequence_dsr(
     # prepare for interation
     unfixed = (tokens < 0) # just init an all-False tensor
     unfixed[:, -layout[-1] + layout[-2]:] = True
-    
+
     ll, rr = block_hw
     edge_len = int(math.sqrt(layout[-1] - layout[-2]) + 1e-4)
     num_steps = warmup_steps + ll - 1 + rr
     # interative refining
-    
+
     # unfixed[..., -(layout[-1] - layout[-2]):].view(
     #     batch_size, edge_len//ll, ll, edge_len//rr, rr)[:, :, :, :, -1] = False
-    
-    
-    ret = []
-    ret.append(tokens[:, layout[-2]+1:].clone())
+
+
+    ret = [tokens[:, layout[-2]+1:].clone()]
+    real_temp = 1.
     for step_cnt in range(1, num_steps+1):
         if step_cnt <= warmup_steps:
             logits, *_dump = model(tokens[:,:-1], position_ids, attention_mask, log_attention_weights=log_attention_weights)
-            real_temp = 1.
             new_tokens = strategy.forward(logits, tokens, real_temp)
             tokens[unfixed] = new_tokens[unfixed]
         else:
             logits, *_dump = model(tokens[:,:-1], position_ids, attention_mask, log_attention_weights=log_attention_weights)
-            real_temp = 1.
             new_tokens = strategy.forward(
                 logits, tokens, real_temp,
                 entfilter=1.3,
@@ -153,7 +151,7 @@ def filling_sequence_dsr(
                     unfixed2[..., -(layout[-1] - layout[-2]):].view(
                         batch_size, edge_len//ll, ll, edge_len//rr, rr)[:, :, x, :, y] = True
             tokens[unfixed2] = new_tokens[unfixed2]
-                
+
         ret.append(tokens[:, layout[-2]+1:].clone())
 
     return ret
